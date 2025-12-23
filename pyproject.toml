@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apex-protocol"
+version = "0.3.0"
+description = "Agent-to-Agent Commerce Layer - Discovery, Negotiation, and Payments"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "APEX Protocol" }
+]
+keywords = [
+    "ai",
+    "agents",
+    "commerce",
+    "negotiation",
+    "payments",
+    "llm",
+    "protocol",
+    "usdc",
+    "base",
+    "blockchain",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Core
+    "httpx>=0.25.0",
+    "starlette>=0.32.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    
+    # LLM (included by default)
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "langchain>=0.1.0",
+    "langchain-openai>=0.0.5",
+    
+    # Payments (USDC on Base)
+    "web3>=6.0.0",
+    "eth-account>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/apex-protocol/apex-sdk"
+Documentation = "https://docs.apex-protocol.ai"
+Repository = "https://github.com/apex-protocol/apex-sdk"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/apex",
+    "/README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["apex"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
