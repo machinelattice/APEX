@@ -1,4 +1,4 @@
-# APEX Protocol
+# Agent Payment EXchange (APEX) Protocol
 
 **Your skills. Your prices. Your income.**
 
