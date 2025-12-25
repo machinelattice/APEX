@@ -82,6 +82,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | **Buyer** | An agent requesting a service |
 | **Seller** | An agent providing a service |
 | **Capability** | A discrete service a seller can perform |
+| **Estimate** | A task-specific price prediction before negotiation |
 | **Job** | A single instance of capability execution |
 | **Offer** | A price proposed by either party |
 | **Terms** | The agreed-upon conditions for a job |
@@ -95,22 +96,22 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 APEX defines five logical layers:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 4: Settlement                                        │
-│  Payment rails, escrow, receipts                            │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 3: Negotiation                                       │
-│  propose → counter → accept/reject                          │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 2: Discovery                                         │
-│  Capability declaration, pricing models                     │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 1: Identity                                          │
-│  Agent IDs, signatures, verification                        │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 0: Transport                                         │
-│  HTTP, WebSocket, etc.                                      │
-└─────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------+
+|  Layer 4: Settlement                                          |
+|  Payment rails, escrow, receipts                              |
++---------------------------------------------------------------+
+|  Layer 3: Negotiation                                         |
+|  propose -> counter -> accept/reject                          |
++---------------------------------------------------------------+
+|  Layer 2: Discovery & Estimation                              |
+|  Capabilities, pricing, task-specific estimation              |
++---------------------------------------------------------------+
+|  Layer 1: Identity                                            |
+|  Agent IDs, signatures, verification                          |
++---------------------------------------------------------------+
+|  Layer 0: Transport                                           |
+|  HTTP, WebSocket, etc.                                        |
++---------------------------------------------------------------+
 ```
 
 A conforming implementation MUST implement Layers 1-3. Layer 0 is assumed (HTTP by default). Layer 4 (Settlement) MAY be mocked for testing but MUST be implemented for production use.
@@ -139,7 +140,13 @@ pricing:
   amount: 5.00
   currency: USDC
   
-  # For negotiated pricing
+  # For negotiated pricing (two modes):
+  
+  # Mode 1: Base rate (recommended) - agent estimates per task
+  base: 20.00           # Base rate, agent applies multiplier
+  max_rounds: 5         # Maximum negotiation rounds
+  
+  # Mode 2: Static bounds (legacy)
   target: 50.00        # Ideal/starting price
   minimum: 25.00       # Absolute floor
   max_rounds: 5        # Maximum negotiation rounds
@@ -261,10 +268,10 @@ The `apex/discover` method returns runtime capability and pricing information.
         "description": "Deep research on any topic",
         "pricing": {
           "model": "negotiated",
-          "target_amount": 50.00,
-          "min_amount": 25.00,
+          "base": 20.00,
           "max_rounds": 5,
-          "currency": "USDC"
+          "currency": "USDC",
+          "requires_estimation": true
         },
         "input_schema": {
           "type": "object",
@@ -341,6 +348,164 @@ pricing:
 - The algorithm used to calculate counter-offers is implementation-defined
 
 The `strategy` field is OPTIONAL and informational only. The protocol treats price generation as a black box—implementations MAY use fixed rules, machine learning, LLMs, or any other mechanism. See Appendix A for example strategies.
+
+#### 4.4.3 Base Rate Pricing with Estimation
+
+For tasks where complexity varies significantly, sellers MAY use base rate pricing with per-task estimation.
+
+```yaml
+pricing:
+  model: negotiated
+  base: 20.00           # Base rate per task
+  max_rounds: 5
+  currency: USDC
+```
+
+When `base` is specified instead of `target`/`minimum`:
+
+1. The seller indicates `requires_estimation: true` in discovery
+2. Buyers SHOULD call `apex/estimate` before `apex/propose`
+3. The seller returns a task-specific estimate with negotiation bounds
+4. The buyer includes `estimate_id` in their proposal to lock in those bounds
+
+**Protocol Requirements:**
+
+- If `requires_estimation` is true, sellers SHOULD reject proposals without valid `estimate_id` (error 5001)
+- Estimates expire after a configurable period (default: 300 seconds)
+- Estimate bounds become the negotiation bounds for that job
+- The `base` rate is a human-provided anchor; the multiplier is implementation-defined
+
+### 4.5 Estimation
+
+Estimation allows sellers to provide task-specific pricing before negotiation begins.
+
+#### 4.5.1 Overview
+
+The estimation flow addresses price uncertainty in agent work:
+
+1. Buyer discovers agent and sees `requires_estimation: true`
+2. Buyer calls `apex/estimate` with task input
+3. Seller analyzes task and returns price estimate with bounds
+4. Buyer uses estimate to decide whether to proceed
+5. If proceeding, buyer includes `estimate_id` in `apex/propose`
+
+This separates price discovery from negotiation commitment.
+
+#### 4.5.2 apex/estimate Method
+
+**Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "apex/estimate",
+  "params": {
+    "capability": "research",
+    "input": {
+      "topic": "Quantum computing applications in drug discovery"
+    }
+  }
+}
+```
+
+**Response (Estimation Supported):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "result": {
+    "status": "estimated",
+    "estimate_id": "est-a1b2c3d4e5f6",
+    "expires_at": "2025-01-15T10:35:00Z",
+    "estimate": {
+      "amount": 40.00,
+      "minimum": 32.00,
+      "currency": "USDC"
+    },
+    "negotiation": {
+      "target": 40.00,
+      "floor": 32.00
+    },
+    "factors": [
+      {"name": "base_rate", "value": "$20.00"},
+      {"name": "multiplier", "value": "2.0x"}
+    ],
+    "reasoning": "Cross-domain research requiring synthesis of quantum physics and pharmaceutical literature."
+  }
+}
+```
+
+**Response (Fixed Pricing - No Estimation Needed):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "result": {
+    "status": "fixed",
+    "message": "Fixed pricing - no estimation needed",
+    "price": {
+      "amount": 5.00,
+      "currency": "USDC"
+    }
+  }
+}
+```
+
+#### 4.5.3 Estimate Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `status` | string | Yes | `"estimated"` or `"fixed"` |
+| `estimate_id` | string | If estimated | Unique identifier for this estimate |
+| `expires_at` | datetime | If estimated | ISO 8601 expiration time |
+| `estimate.amount` | number | If estimated | Estimated fair price |
+| `estimate.minimum` | number | If estimated | Price floor (typically 80% of amount) |
+| `estimate.currency` | string | If estimated | Currency code |
+| `negotiation.target` | number | If estimated | Seller's target for negotiation |
+| `negotiation.floor` | number | If estimated | Seller's floor for negotiation |
+| `factors` | array | No | Factors that influenced the estimate |
+| `reasoning` | string | No | Human-readable explanation |
+
+#### 4.5.4 Using Estimates in Proposals
+
+When a buyer has obtained an estimate, they include `estimate_id` in `apex/propose`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "2",
+  "method": "apex/propose",
+  "params": {
+    "capability": "research",
+    "input": { "topic": "Quantum computing in drug discovery" },
+    "job_id": "job-uuid-here",
+    "estimate_id": "est-a1b2c3d4e5f6",
+    "offer": {
+      "amount": 25.00,
+      "currency": "USDC"
+    }
+  }
+}
+```
+
+The seller:
+1. Validates the estimate exists and has not expired
+2. Uses the estimate's bounds for this negotiation
+3. Invalidates the estimate (one-time use)
+
+If `estimate_id` is invalid or expired, return error 5001.
+
+#### 4.5.5 Estimation Without Prior Estimate
+
+If a buyer sends `apex/propose` without `estimate_id` to a seller that requires estimation:
+
+- Seller MAY perform inline estimation and proceed
+- Seller MAY reject with error 5002 (Estimate required)
+
+The behavior is implementation-defined. Inline estimation increases latency but improves buyer experience.
 
 ---
 
@@ -441,44 +606,44 @@ Every negotiation is identified by a `job_id`.
 A job progresses through the following states:
 
 ```
-┌──────────────┐
-│   PENDING    │  No contact yet
-└──────┬───────┘
-       │ apex/propose
-       ▼
-┌──────────────┐
-│  PROPOSED    │  Initial offer received
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐  ◀──────────────────┐
-│ NEGOTIATING  │                     │
-└──────┬───────┘  apex/counter       │
-       │              │              │
-       ├──────────────┴──────────────┤
-       │                             │
-       ▼                             ▼
-┌──────────────┐              ┌──────────────┐
-│   ACCEPTED   │              │   REJECTED   │
-└──────┬───────┘              └──────────────┘
-       │
-       │ payment verified
-       ▼
-┌──────────────┐
-│    FUNDED    │  Payment locked/verified
-└──────┬───────┘
-       │
-       │ job starts
-       ▼
-┌──────────────┐
-│  EXECUTING   │  Work in progress
-└──────┬───────┘
-       │
-       ├─────────────────┬─────────────────┐
-       ▼                 ▼                 ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  COMPLETED   │  │    FAILED    │  │   REFUNDED   │
-└──────────────┘  └──────────────┘  └──────────────┘
++--------------+
+|   PENDING    |  No contact yet
++------+-------+
+       | apex/propose
+       v
++--------------+
+|  PROPOSED    |  Initial offer received
++------+-------+
+       |
+       v
++--------------+  <-------------------+
+| NEGOTIATING  |                      |
++------+-------+  apex/counter        |
+       |              |               |
+       +--------------+---------------+
+       |                              |
+       v                              v
++--------------+              +--------------+
+|   ACCEPTED   |              |   REJECTED   |
++------+-------+              +--------------+
+       |
+       | payment verified
+       v
++--------------+
+|    FUNDED    |  Payment locked/verified
++------+-------+
+       |
+       | job starts
+       v
++--------------+
+|  EXECUTING   |  Work in progress
++------+-------+
+       |
+       +-----------------+-----------------+
+       v                 v                 v
++--------------+  +--------------+  +--------------+
+|  COMPLETED   |  |    FAILED    |  |   REFUNDED   |
++--------------+  +--------------+  +--------------+
 ```
 
 **Terminal States:** REJECTED, COMPLETED, FAILED, REFUNDED
@@ -491,7 +656,7 @@ A job progresses through the following states:
 |---------------|---------------|------------|-----------|
 | PENDING | apex/propose | PROPOSED | Always |
 | PROPOSED | (evaluate) | NEGOTIATING | Offer < target |
-| PROPOSED | (evaluate) | ACCEPTED | Offer ≥ target (fixed) or ≥ minimum (negotiated) |
+| PROPOSED | (evaluate) | ACCEPTED | Offer >= target (fixed) or >= minimum (negotiated) |
 | NEGOTIATING | apex/counter | NEGOTIATING | Round < max_rounds |
 | NEGOTIATING | apex/counter | ACCEPTED | Offer acceptable |
 | NEGOTIATING | apex/accept | ACCEPTED | Buyer accepts counter |
@@ -788,20 +953,20 @@ Settlement methods that cannot provide machine-verifiable confirmation (e.g., in
 ### 6.2 Settlement Interface
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Settlement Interface                      │
-├─────────────────────────────────────────────────────────────┤
-│  lock(job_id, amount, seller) → LockResult                  │
-│  release(job_id) → ReleaseResult                            │
-│  refund(job_id) → RefundResult                              │
-│  verify(proof) → bool                                       │
-└─────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│    Base     │      │   Stripe    │      │    Mock     │
-│   (USDC)    │      │  (Connect)  │      │  (Testing)  │
-└─────────────┘      └─────────────┘      └─────────────┘
++---------------------------------------------------------------+
+|                    Settlement Interface                        |
++---------------------------------------------------------------+
+|  lock(job_id, amount, seller) -> LockResult                   |
+|  release(job_id) -> ReleaseResult                             |
+|  refund(job_id) -> RefundResult                               |
+|  verify(proof) -> bool                                        |
++---------------------------------------------------------------+
+         |                    |                    |
+         v                    v                    v
++-------------+      +-------------+      +-------------+
+|    Base     |      |   Stripe    |      |    Mock     |
+|   (USDC)    |      |  (Connect)  |      |  (Testing)  |
++-------------+      +-------------+      +-------------+
 ```
 
 #### 6.2.1 IApexEscrow Interface (Normative)
@@ -874,29 +1039,29 @@ interface IApexEscrow {
 **Standard Flow (Escrow):**
 
 ```
-1. Buyer locks funds     →  lock(job_id, amount, seller)
-2. Seller executes job   →  (work happens)
-3. Buyer receives output →  (verifies satisfaction)
-4. Funds released        →  release(job_id)
+1. Buyer locks funds     ->  lock(job_id, amount, seller)
+2. Seller executes job   ->  (work happens)
+3. Buyer receives output ->  (verifies satisfaction)
+4. Funds released        ->  release(job_id)
 ```
 
 **Dispute Flow:**
 
 ```
-1. Buyer locks funds     →  lock(job_id, amount, seller)
-2. Seller executes job   →  (work happens)
-3. Buyer disputes        →  dispute(job_id, reason)
-4. Resolution            →  release() or refund()
+1. Buyer locks funds     ->  lock(job_id, amount, seller)
+2. Seller executes job   ->  (work happens)
+3. Buyer disputes        ->  dispute(job_id, reason)
+4. Resolution            ->  release() or refund()
 ```
 
 **Trust-Based Flow (No Escrow):**
 
 ```
-1. Negotiation completes →  terms agreed
-2. Buyer pays directly   →  (off-protocol)
-3. Buyer sends proof     →  apex/accept with payment_proof
-4. Seller verifies       →  verify(proof)
-5. Seller executes       →  (work happens)
+1. Negotiation completes ->  terms agreed
+2. Buyer pays directly   ->  (off-protocol)
+3. Buyer sends proof     ->  apex/accept with payment_proof
+4. Seller verifies       ->  verify(proof)
+5. Seller executes       ->  (work happens)
 ```
 
 **Fair Exchange Limitation:** The Trust-Based Flow does not guarantee atomic exchange. Once the buyer submits payment, the seller may fail to deliver (crash, malice, or error). APEX v1 does not define an on-chain escrow contract or atomic swap mechanism.
@@ -1094,13 +1259,13 @@ When verifying, implementations:
 
 1. MUST check that `signer` matches the expected counterparty
 2. MUST verify that `signature` is valid for the canonical payload
-3. MUST reject messages with `timestamp` outside the acceptable skew window (default: ±5 minutes)
+3. MUST reject messages with `timestamp` outside the acceptable skew window (default: +/-5 minutes)
 
 **Replay Protection:**
 
 Implementations MUST reject signed messages with timestamps outside the acceptable skew window. This prevents replay attacks where a valid signed message is resubmitted.
 
-The default skew window is ±5 minutes. Implementations MAY configure a tighter window for high-security contexts.
+The default skew window is +/-5 minutes. Implementations MAY configure a tighter window for high-security contexts.
 
 Implementations MUST treat `(job_id, signer, timestamp)` as a uniqueness tuple and reject duplicates. This prevents replay of valid signed messages within the skew window.
 
@@ -1248,6 +1413,14 @@ APEX defines structured error codes for machine-readable error handling.
 | 4003 | Input invalid | Input didn't match schema |
 | 4004 | Rate limited | Too many requests |
 
+#### Estimation Errors (5xxx)
+
+| Code | Message | Description |
+|------|---------|-------------|
+| 5001 | Estimate invalid | Estimate not found, expired, or already used |
+| 5002 | Estimate required | Seller requires estimation before proposal |
+| 5003 | Estimation failed | Unable to generate estimate for input |
+
 ### 9.3 Error Code Governance
 
 Error codes are critical to protocol stability. The following rules ensure consistent error handling across implementations and versions.
@@ -1267,9 +1440,10 @@ Error codes are critical to protocol stability. The following rules ensure consi
 | 2xxx | Negotiation errors |
 | 3xxx | Payment errors |
 | 4xxx | Execution errors |
-| 5xxx-9xxx | Implementation-defined (custom) |
+| 5xxx | Estimation errors |
+| 6xxx-9xxx | Implementation-defined (custom) |
 
-**Custom Error Codes:** Implementations MAY define custom error codes in the 5xxx-9xxx range for application-specific errors. Custom codes MUST be documented and SHOULD follow the same governance rules. Implementations MUST use standard error codes when applicable; custom error codes MUST NOT replace defined protocol errors.
+**Custom Error Codes:** Implementations MAY define custom error codes in the 6xxx-9xxx range for application-specific errors. Custom codes MUST be documented and SHOULD follow the same governance rules. Implementations MUST use standard error codes when applicable; custom error codes MUST NOT replace defined protocol errors.
 
 **Deprecation:** To deprecate an error code, mark it as deprecated in the registry but do not remove or reassign it. Implementations SHOULD continue to accept deprecated codes from older peers.
 
@@ -1404,7 +1578,7 @@ This appendix describes example negotiation strategies. These are **informationa
 A common approach for algorithmic strategies:
 
 ```
-counter_price = target - (target - minimum) × (1 - e^(-risk × t × 3))
+counter_price = target - (target - minimum) * (1 - e^(-risk * t * 3))
 
 where:
   t = current_round / max_rounds
@@ -1430,39 +1604,87 @@ The protocol makes no assumptions about pricing logic.
 
 ## Appendix B: Example Negotiation Flow
 
+### B.1 Standard Negotiation (Static Bounds)
+
 ```
 TIME    BUYER                          SELLER
-────────────────────────────────────────────────────────────
+------------------------------------------------------------------------
 
 T+0     apex/propose
-        offer: $30                 →
+        offer: $30                 ->
                                        [evaluate: $30 < $50 target]
                                        [strategy: balanced]
                                        [counter at: $47]
-                                   ←   counter: $47, round 1
+                                   <-  counter: $47, round 1
                                        "Given the research depth..."
 
 T+1     [evaluate: $47 within budget]
         [counter at: $35]
         apex/counter
-        offer: $35                 →
+        offer: $35                 ->
                                        [evaluate: $35 < $47]
-                                       [concession curve → $42]
-                                   ←   counter: $42, round 2
+                                       [concession curve -> $42]
+                                   <-  counter: $42, round 2
                                        "I can work with $42..."
 
 T+2     [evaluate: $42 acceptable]
         [decide: accept]
         apex/accept
-        terms: $42                 →
+        terms: $42                 ->
         payment_proof: 0xabc...
                                        [verify payment]
                                        [execute job]
-                                   ←   completed
+                                   <-  completed
                                        output: "Research report..."
 
-────────────────────────────────────────────────────────────
+------------------------------------------------------------------------
 RESULT: Deal closed at $42 after 2 rounds
+```
+
+### B.2 Negotiation with Estimation (Base Rate Mode)
+
+```
+TIME    BUYER                          SELLER
+------------------------------------------------------------------------
+
+T+0     apex/discover              ->
+                                   <-  capabilities, requires_estimation: true
+                                       base: $20.00
+
+T+1     apex/estimate
+        input: "Quantum computing
+        in drug discovery"        ->
+                                       [analyze task complexity]
+                                       [multiplier: 2.0x]
+                                   <-  estimate_id: est-abc123
+                                       amount: $40, minimum: $32
+
+T+2     [budget check: $40 <= $50 OK]
+        apex/propose
+        estimate_id: est-abc123
+        offer: $25                 ->
+                                       [validate estimate]
+                                       [bounds: target=$40, floor=$32]
+                                       [counter at: $38]
+                                   <-  counter: $38, round 1
+                                       "Cross-domain research..."
+
+T+3     apex/counter
+        offer: $32                 ->
+                                       [evaluate: $32 = floor]
+                                   <-  counter: $35, round 2
+                                       "Final offer..."
+
+T+4     apex/accept
+        terms: $35                 ->
+        payment_proof: 0xdef...
+                                       [verify payment]
+                                       [execute job]
+                                   <-  completed
+                                       output: "Research report..."
+
+------------------------------------------------------------------------
+RESULT: Deal closed at $35 (88% of estimate) after 2 rounds
 ```
 
 ---
@@ -1494,6 +1716,11 @@ The reference implementation is available at:
 
 - Initial specification
 - Discovery, Negotiation, Settlement layers
+- **Estimation layer** for task-specific pricing (section 4.5)
+  - `apex/estimate` method for pre-negotiation price discovery
+  - Base rate pricing mode with LLM-based multipliers
+  - Estimate caching with expiration
+  - Error codes 5001-5003 for estimation failures
 - Negotiation strategies moved to non-normative appendix
 - EIP-712 mandatory for Ethereum identity signing (ad-hoc schemes prohibited)
 - EIP-55 checksum encoding required for Ethereum addresses

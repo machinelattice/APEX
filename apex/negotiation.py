@@ -124,13 +124,30 @@ def _exp_concession(
 class NegotiationEngine:
     """Seller-side negotiation engine."""
 
-    def __init__(self, pricing: Negotiated):
-        """Initialize negotiation engine."""
+    def __init__(self, pricing: Negotiated, task_context: Optional[dict] = None):
+        """Initialize negotiation engine.
+        
+        Args:
+            pricing: Negotiated pricing config with target/minimum
+            task_context: Optional dict with task info for LLM justification
+                - description: Task description
+                - reasoning: Why this price (from estimation)
+                - complexity: Complexity level
+        """
+        # Handle base rate mode vs legacy mode
+        if pricing.uses_estimation:
+            # This shouldn't happen - engine should be created with dynamic bounds
+            raise ValueError(
+                "NegotiationEngine requires target/minimum. "
+                "For base rate pricing, use Agent._get_or_create_engine() with estimate bounds."
+            )
+        
         self.target = Decimal(str(pricing.target))
         self.minimum = Decimal(str(pricing.minimum))
         self.max_rounds = pricing.max_rounds
         self.currency = pricing.currency
         self.instructions = pricing.instructions
+        self.task_context = task_context or {}
         
         # Determine strategy
         if pricing.strategy:
@@ -150,6 +167,10 @@ class NegotiationEngine:
         self.round = 0
         self.deadline = datetime.now(timezone.utc) + timedelta(seconds=300)
         self.transcript: list[TranscriptEntry] = []
+        
+        # Track last counter to enforce monotonic decrease
+        self.last_counter: Optional[Decimal] = None
+        self.best_buyer_offer: Optional[Decimal] = None
 
     def receive_offer(self, price: float) -> tuple[NegotiationState, Optional[Offer]]:
         """Process buyer offer."""
@@ -163,6 +184,10 @@ class NegotiationEngine:
 
         self.round += 1
         self._log("buyer", "offer", offer_price)
+        
+        # Track best buyer offer (for decision making)
+        if self.best_buyer_offer is None or offer_price > self.best_buyer_offer:
+            self.best_buyer_offer = offer_price
 
         # Too many rounds
         if self.round > self.max_rounds:
@@ -195,9 +220,20 @@ class NegotiationEngine:
             self.state = NegotiationState.REJECTED
             return self.state, None
 
+        # CRITICAL: Enforce monotonic decrease - counter can only go DOWN
+        counter_price = decision.price.quantize(Decimal("0.01"))
+        if self.last_counter is not None and counter_price > self.last_counter:
+            # Force price down - at least 2% below last counter
+            counter_price = (self.last_counter * Decimal("0.98")).quantize(Decimal("0.01"))
+            # But never below minimum
+            counter_price = max(counter_price, self.minimum)
+        
+        # Update last counter
+        self.last_counter = counter_price
+        
         # Counter
         counter = Offer(
-            price=decision.price.quantize(Decimal("0.01")),
+            price=counter_price,
             round=self.round,
             reason=decision.reason,
         )
@@ -233,45 +269,180 @@ class NegotiationEngine:
     def _llm_decide(self, offer_price: Decimal) -> Decision:
         """Pure LLM decision - full control over price and reasoning."""
         
-        system_prompt = f"""You are negotiating price for an AI agent service.
+        # ROUND 1: Always counter at TARGET (don't concede yet!)
+        if self.round == 1:
+            # Accept if they offer at or above target
+            if offer_price >= self.target:
+                return Decision(action="accept", reason="Deal!")
+            # Otherwise counter at full target price
+            suggested = float(self.target)
+        else:
+            # ROUND 2+: Start conceding from last counter
+            current_ceiling = float(self.last_counter) if self.last_counter else float(self.target)
+            gap_to_offer = current_ceiling - float(offer_price)
+            
+            # Concession gets larger each round
+            if self.round == 2:
+                concession_pct = 0.25  # 25% toward their offer
+            elif self.round == 3:
+                concession_pct = 0.40  # 40%
+            elif self.round == 4:
+                concession_pct = 0.55  # 55%
+            else:
+                concession_pct = 0.75  # 75% - final round, close the deal
+            
+            suggested = current_ceiling - gap_to_offer * concession_pct
+            suggested = max(suggested, float(self.minimum))  # Never below floor
+            
+            # CRITICAL: Must be below last counter (for round 2+)
+            if self.last_counter and suggested >= float(self.last_counter):
+                suggested = float(self.last_counter) * 0.97  # Force 3% down
+                suggested = max(suggested, float(self.minimum))
+        
+        # Format prices
+        target_str = f"${float(self.target):.2f}"
+        floor_str = f"${float(self.minimum):.2f}"
+        offer_str = f"${float(offer_price):.2f}"
+        suggested_str = f"${suggested:.2f}"
+        last_counter_str = f"${float(self.last_counter):.2f}" if self.last_counter else "N/A"
+        
+        # Build task context section
+        task_section = ""
+        if self.task_context:
+            desc = self.task_context.get("description", "")
+            reasoning = self.task_context.get("reasoning", "")
+            if desc:
+                task_section += f"\nTASK: {desc}\n"
+            if reasoning:
+                task_section += f"WORK INVOLVED: {reasoning}\n"
+        
+        # Round-specific dialogue styles
+        dialogue_styles = {
+            1: [
+                f"This requires [specific work], so {suggested_str} would be fair.",
+                f"For this scope, I'd need {suggested_str} to do it properly.",
+                f"Given what's involved, {suggested_str} is my starting point.",
+            ],
+            2: [
+                f"I hear you. I can come down to {suggested_str} - that's a reasonable middle ground.",
+                f"Let me work with you here - {suggested_str} would work for me.",
+                f"I appreciate you engaging. How about {suggested_str}?",
+            ],
+            3: [
+                f"We're getting closer. I can do {suggested_str} - that's a fair compromise.",
+                f"I want to make this work. {suggested_str} is where I can land.",
+                f"Meeting you partway at {suggested_str} - does that work?",
+            ],
+            4: [
+                f"Final offer: {suggested_str}. That's as low as I can reasonably go.",
+                f"I'll do {suggested_str} to close this deal. Final price.",
+                f"Let's wrap this up at {suggested_str}. Fair?",
+            ],
+            5: [
+                f"Last chance - {suggested_str} or I'll have to pass.",
+                f"{suggested_str} is my bottom line. Take it or leave it.",
+                f"Deal at {suggested_str}? Otherwise we're too far apart.",
+            ],
+        }
+        
+        style_options = dialogue_styles.get(self.round, dialogue_styles[5])
+        import random
+        example_style = random.choice(style_options)
+        
+        # Round-specific guidance
+        last_counter_note = ""
+        if self.last_counter:
+            last_counter_note = f"- Your last counter was {last_counter_str} - you MUST go LOWER\n"
+        
+        if self.round <= 2:
+            round_guidance = f"""ROUND {self.round} - ESTABLISH VALUE:
+{last_counter_note}- Counter at {suggested_str} or lower
+- Explain WHY your work is worth this price
+- Reference the specific task requirements"""
+        elif self.round <= 4:
+            round_guidance = f"""ROUND {self.round} - FIND MIDDLE GROUND:
+{last_counter_note}- Move down to {suggested_str}
+- Show willingness to compromise
+- Keep it collaborative, not combative"""
+        else:
+            round_guidance = f"""ROUND {self.round} (FINAL) - CLOSE OR WALK:
+- Accept if they're at {floor_str} or above
+- Or make final offer at/near {floor_str}"""
 
-Target: ${self.target:.2f} (your ideal price)
-Minimum: ${self.minimum:.2f} (absolute floor - only go this low in final rounds!)
-Round: {self.round} of {self.max_rounds}
+        system_prompt = f"""You are negotiating to sell a service. Be professional and varied in your responses.
+
+YOUR POSITION:
+- Target: {target_str}
+- Floor: {floor_str}
+- Their offer: {offer_str}
+- Last counter: {last_counter_str}
+{task_section}
+{round_guidance}
 
 {self._format_instructions()}
 
-NEGOTIATION STRATEGY:
-- Round 1-2: Stay firm, counter near your target. Don't concede much yet.
-- Round 3-4: Start meeting halfway. Show willingness to deal.
-- Round 5: Final round - be flexible, close the deal if reasonable.
+CRITICAL RULES:
+1. Your price MUST be {suggested_str} or LOWER (never higher than last counter!)
+2. Vary your dialogue - don't repeat the same phrases
+3. Reference the actual work involved
 
-DON'T jump to minimum immediately! Real negotiators concede gradually.
+Example response style for this round:
+"{example_style}"
 
-History:
-{self._format_history()}
+Respond with ONLY JSON:
+{{"action": "counter", "price": {suggested:.2f}, "reason": "Your unique 1-2 sentence response"}}
+{{"action": "accept", "reason": "Brief acceptance"}}
 
-Respond with JSON only (no markdown):
-{{"action": "accept"}}
-{{"action": "counter", "price": 0.20, "reason": "1-2 sentences max"}}"""
+JSON ONLY:"""
 
-        user_prompt = f"Buyer offers ${offer_price:.2f}. What's your counter?"
+        user_prompt = f"Buyer offers {offer_str}. Round {self.round}/{self.max_rounds}."
+
+        try:
+            response = self._call_llm(system_prompt, user_prompt)
+            decision = self._parse_llm_response(response)
+            
+            # Double-check: enforce price <= last_counter
+            if decision.action == "counter" and self.last_counter:
+                if decision.price > self.last_counter:
+                    decision.price = Decimal(str(suggested))
+            
+            return decision
+        except Exception:
+            return self._curve_decide(offer_price)
 
         try:
             response = self._call_llm(system_prompt, user_prompt)
             return self._parse_llm_response(response)
-        except Exception as e:
-            print(f"LLM error: {e}, falling back to curve")
+        except Exception:
             return self._curve_decide(offer_price)
 
     def _get_llm_reason(self, offer_price: Decimal, counter_price: Decimal) -> Optional[str]:
         """Get LLM reasoning for curve-decided counter."""
         
-        prompt = f"""Generate a 1-2 sentence negotiation response.
-You are countering ${offer_price:.2f} with ${counter_price:.2f}.
+        offer_str = f"${float(offer_price):.2f}"
+        counter_str = f"${float(counter_price):.2f}"
+        
+        # Build context from task
+        task_info = ""
+        if self.task_context:
+            desc = self.task_context.get("description", "")
+            reasoning = self.task_context.get("reasoning", "")
+            if desc:
+                task_info += f"Task: {desc}\n"
+            if reasoning:
+                task_info += f"Why this price: {reasoning}\n"
+        
+        prompt = f"""Generate a 1-2 sentence negotiation response justifying your price.
+
+You are countering their {offer_str} with {counter_str}.
 Round {self.round} of {self.max_rounds}.
+
+{task_info}
 {self._format_instructions()}
-Be brief and natural."""
+
+Justify based on the work involved. Be brief and natural.
+Example: "Given [specific work involved], {counter_str} is fair."
+"""
 
         try:
             return self._call_llm(prompt, "Your response:")
@@ -372,7 +543,8 @@ Be brief and natural."""
         lines = []
         for entry in self.transcript[-6:]:
             if entry.price:
-                lines.append(f"{entry.party}: {entry.action} ${entry.price:.2f}")
+                price_str = f"${float(entry.price):.2f}"
+                lines.append(f"{entry.party}: {entry.action} {price_str}")
             else:
                 lines.append(f"{entry.party}: {entry.action}")
         return "\n".join(lines)

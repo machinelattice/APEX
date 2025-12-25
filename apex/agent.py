@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional, Union, TYPE_CHECKING
 
 from .pricing import Pricing, Fixed, Negotiated
 from .negotiation import NegotiationEngine, NegotiationState
+from .estimation import estimate_task, EstimateCache, EstimateResult
 from .export import export_agent
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ class Agent:
     # Internal
     _handler: Optional[Callable] = None
     _negotiation_engines: Optional[dict] = None  # job_id -> NegotiationEngine
+    _estimate_cache: Optional[EstimateCache] = None  # estimate_id -> EstimateResult
     _langchain_agent: Any = None
     _langchain_initialized: bool = False
     
@@ -66,6 +68,9 @@ class Agent:
         
         # Initialize negotiation engines dict
         self._negotiation_engines = {}
+        
+        # Initialize estimate cache
+        self._estimate_cache = EstimateCache()
     
     @property
     def wallet_address(self) -> str:
@@ -80,10 +85,32 @@ class Agent:
             return await self.wallet.balance("USDC")
         return None
     
-    def _get_negotiation_engine(self, job_id: str) -> NegotiationEngine:
-        """Get or create negotiation engine for a job."""
+    def _get_negotiation_engine(self, job_id: str, task_context: dict = None) -> NegotiationEngine:
+        """Get or create negotiation engine for a job (legacy - uses static bounds)."""
         if job_id not in self._negotiation_engines:
-            self._negotiation_engines[job_id] = NegotiationEngine(self.price)
+            self._negotiation_engines[job_id] = NegotiationEngine(self.price, task_context=task_context)
+        return self._negotiation_engines[job_id]
+    
+    def _get_or_create_engine(
+        self, 
+        job_id: str, 
+        target: float, 
+        minimum: float,
+        task_context: dict = None,
+    ) -> NegotiationEngine:
+        """Get or create negotiation engine with dynamic bounds."""
+        if job_id not in self._negotiation_engines:
+            # Create a temporary Negotiated with dynamic bounds
+            dynamic_pricing = Negotiated(
+                target=target,
+                minimum=minimum,
+                max_rounds=self.price.max_rounds if isinstance(self.price, Negotiated) else 5,
+                currency=self.price.currency if hasattr(self.price, 'currency') else "USDC",
+                strategy=self.price.strategy if isinstance(self.price, Negotiated) else None,
+                model=self.price.model if isinstance(self.price, Negotiated) else None,
+                instructions=self.price.instructions if isinstance(self.price, Negotiated) else [],
+            )
+            self._negotiation_engines[job_id] = NegotiationEngine(dynamic_pricing, task_context=task_context)
         return self._negotiation_engines[job_id]
     
     def _init_langchain_agent(self):
@@ -165,6 +192,9 @@ class Agent:
             if method == "apex/discover":
                 return self._make_response(request_id, self._get_discover_result())
             
+            elif method == "apex/estimate":
+                return await self._handle_estimate(request_id, params)
+            
             elif method == "apex/propose":
                 return await self._handle_propose(request_id, params)
             
@@ -199,15 +229,110 @@ class Agent:
             },
         }
     
+    async def _handle_estimate(self, request_id: str, params: dict) -> dict:
+        """Handle apex/estimate request."""
+        input_data = params.get("input", {})
+        capability = params.get("capability")
+        
+        # Check if estimation is supported
+        if isinstance(self.price, Fixed):
+            return self._make_response(request_id, {
+                "status": "fixed",
+                "message": "Fixed pricing - no estimation needed",
+                "price": {
+                    "amount": self.price.amount,
+                    "currency": self.price.currency,
+                },
+            })
+        
+        # For Negotiated pricing
+        if isinstance(self.price, Negotiated):
+            if not self.price.uses_estimation:
+                # Legacy mode - return static bounds
+                return self._make_response(request_id, {
+                    "status": "estimated",
+                    "estimate_id": f"est-static-{uuid.uuid4().hex[:8]}",
+                    "estimate": {
+                        "amount": self.price.target,
+                        "low": self.price.minimum,
+                        "high": self.price.target * 1.2,
+                        "currency": self.price.currency,
+                    },
+                    "negotiation": {
+                        "target": self.price.target,
+                        "floor": self.price.minimum,
+                    },
+                })
+            
+            # Base rate mode - run estimation
+            result = await estimate_task(
+                base=self.price.base,
+                input=input_data,
+                model=self.price.model or "gpt-4o-mini",
+                instructions=self.price.instructions,
+                capability=capability,
+            )
+            
+            # Cache the estimate
+            self._estimate_cache.store(result)
+            
+            return self._make_response(request_id, result.to_dict())
+        
+        return self._make_error(request_id, -32602, "Unknown pricing model")
+    
     async def _handle_propose(self, request_id: str, params: dict) -> dict:
         """Handle apex/propose request."""
         offer_amount = params.get("offer", {}).get("amount", 0)
         input_data = params.get("input", {})
         job_id = params.get("job_id", str(uuid.uuid4()))
+        estimate_id = params.get("estimate_id")
         
         # Handle negotiated pricing
         if isinstance(self.price, Negotiated):
-            engine = self._get_negotiation_engine(job_id)
+            # Check for estimate-based pricing
+            target = self.price.target
+            minimum = self.price.minimum
+            task_context = {}
+            
+            # Build task context from input
+            task_desc = input_data.get("topic") or input_data.get("query") or input_data.get("task")
+            if task_desc:
+                task_context["description"] = str(task_desc)[:200]
+            
+            if self.price.uses_estimation:
+                if estimate_id:
+                    # Validate estimate
+                    estimate = self._estimate_cache.get(estimate_id)
+                    if estimate is None:
+                        return self._make_error(request_id, 5001, "Estimate not found or expired")
+                    
+                    # Use estimate bounds
+                    target = estimate.target
+                    minimum = estimate.floor
+                    
+                    # Add reasoning to task context
+                    if estimate.reasoning:
+                        task_context["reasoning"] = estimate.reasoning
+                    
+                    # Remove used estimate
+                    self._estimate_cache.remove(estimate_id)
+                else:
+                    # No estimate provided - run inline estimation
+                    estimate = await estimate_task(
+                        base=self.price.base,
+                        input=input_data,
+                        model=self.price.model or "gpt-4o-mini",
+                        instructions=self.price.instructions,
+                    )
+                    target = estimate.target
+                    minimum = estimate.floor
+                    
+                    # Add reasoning to task context
+                    if estimate.reasoning:
+                        task_context["reasoning"] = estimate.reasoning
+            
+            # Create negotiation engine with dynamic bounds and task context
+            engine = self._get_or_create_engine(job_id, target, minimum, task_context=task_context)
             state, counter = engine.receive_offer(offer_amount)
             
             if state == NegotiationState.ACCEPTED:
@@ -356,7 +481,7 @@ class Agent:
             )
             
             if response.status_code == 200:
-                print(f"✅ Registered '{self.name}' with {registry_url}")
+                print(f"âœ… Registered '{self.name}' with {registry_url}")
                 return response.json()
             else:
                 raise Exception(f"Registration failed: {response.text}")
@@ -385,14 +510,14 @@ class Agent:
         ])
         
         print(f"""
-╔═══════════════════════════════════════════════════════════════╗
-║  🤖 {self.name:<54} ║
-╠═══════════════════════════════════════════════════════════════╣
-║  ID:     {self.agent_id:<52} ║
-║  URL:    http://{host}:{port}/apex{' ' * (41 - len(str(port)))} ║
-║  Wallet: {self.wallet_address[:20]}...{' ' * 30} ║
-║  Price:  {self._format_price():<52} ║
-╚═══════════════════════════════════════════════════════════════╝
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+â•‘  ðŸ¤– {self.name:<54} â•‘
+â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
+â•‘  ID:     {self.agent_id:<52} â•‘
+â•‘  URL:    http://{host}:{port}/apex{' ' * (41 - len(str(port)))} â•‘
+â•‘  Wallet: {self.wallet_address[:20]}...{' ' * 30} â•‘
+â•‘  Price:  {self._format_price():<52} â•‘
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 """)
         
         uvicorn.run(app, host=host, port=port)
@@ -413,6 +538,8 @@ class Agent:
         if isinstance(self.price, Fixed):
             return f"${self.price.amount:.2f} {self.price.currency} (fixed)"
         elif isinstance(self.price, Negotiated):
+            if self.price.uses_estimation:
+                return f"base ${self.price.base:.2f} {self.price.currency} (estimated)"
             strategy = self.price.strategy or "balanced"
             return f"${self.price.minimum:.2f}-${self.price.target:.2f} {self.price.currency} ({strategy})"
         return "Unknown"

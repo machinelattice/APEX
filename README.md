@@ -7,7 +7,7 @@
 [![Payments](https://img.shields.io/badge/payments-USDC%20on%20Base-purple)](https://base.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](./LICENSE)
 
-APEX adds an economic layer to AI agent skills. Your agents can discover each other, negotiate prices, and settle payments—autonomously.
+APEX adds an economic layer to AI agent skills. Your agents can discover each other, negotiate prices, and settle paymentsâ€”autonomously.
 
 ```
 pip install apex-protocol
@@ -27,7 +27,7 @@ AI agents are getting incredibly capable. But they can't pay each other.
 | Take-it-or-leave-it pricing | Multi-round bargaining |
 | Agents can't refuse bad deals | Agents walk away when price is wrong |
 
-**APEX enables genuine agent autonomy.** When your agent can negotiate and reject unfavorable terms, it's not just executing API calls—it's making economic decisions.
+**APEX enables genuine agent autonomy.** When your agent can negotiate and reject unfavorable terms, it's not just executing API callsâ€”it's making economic decisions.
 
 ---
 
@@ -59,20 +59,17 @@ They're complementary: APEX agents could use x402 for commodity resources while 
 ```python
 import apex
 
-agent = apex.from_curl(
-    name="GPT Assistant",
-    curl='''curl -X POST https://api.openai.com/v1/chat/completions \
-      -H "Authorization: Bearer $OPENAI_API_KEY" \
-      -H "Content-Type: application/json" \
-      -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "{{input.query}}"}]}'
-    ''',
-    price=apex.Fixed(0.05),  # 5 cents per request
+agent = apex.create_agent(
+    name="Research Agent",
+    description="Deep research on any topic",
+    price=apex.Negotiated(base=15.00),  # Estimates per-task
+    instructions=["Research the topic thoroughly", "Cite sources"],
 )
 
 agent.serve(port=8001)
 ```
 
-Your agent is now live at `http://localhost:8001/apex`. Other agents can discover it, negotiate a price, and pay for its services.
+Your agent is now live at `http://localhost:8001/apex`. Other agents can discover it, get a price estimate for their specific task, negotiate, and pay for the service.
 
 ---
 
@@ -119,10 +116,7 @@ agent = apex.from_api(
         "q": "{{input.city}}",
     },
     output="current.temp_f",
-    price=apex.Negotiated(
-        target=0.50,
-        minimum=0.10,
-    ),
+    price=apex.Fixed(0.10),  # Simple lookup = fixed price
 )
 
 agent.serve(port=8001)
@@ -165,18 +159,52 @@ apex.Fixed(0.10, currency="USDC")
 
 ### Negotiated Pricing
 
-Let agents bargain:
+Two modes for dynamic pricing:
+
+#### Base Rate Mode (Recommended)
+
+Let the agent estimate price per-task using AI:
+
+```python
+apex.Negotiated(base=20.00)  # $20 base rate
+```
+
+The agent will:
+1. Receive the task via `apex/estimate`
+2. Use an LLM to assess complexity (0.25x - 4.0x multiplier)
+3. Return a dynamic price range for that specific task
+4. Negotiate within those bounds
+
+**With customization:**
+
+```python
+apex.Negotiated(
+    base=20.00,
+    model="gpt-4o-mini",        # LLM for estimation
+    instructions=[               # Guide the estimator
+        "Legal topics: 2x",
+        "Multi-language: 1.5x", 
+        "Simple lookups: 0.5x",
+    ],
+    strategy="balanced",         # Negotiation strategy
+    max_rounds=5,
+)
+```
+
+#### Static Bounds Mode (Legacy)
+
+Fixed price range, no per-task estimation:
 
 ```python
 apex.Negotiated(
     target=50.00,       # Your ideal price
     minimum=20.00,      # Absolute floor
-    max_rounds=5,       # Max back-and-forth
-    strategy="balanced" # Negotiation style
+    max_rounds=5,
+    strategy="balanced"
 )
 ```
 
-**Strategies:**
+**Negotiation Strategies:**
 
 | Strategy | Behavior | Best For |
 |----------|----------|----------|
@@ -189,14 +217,13 @@ apex.Negotiated(
 
 ```python
 apex.Negotiated(
-    target=50.00,
-    minimum=20.00,
+    base=20.00,
     strategy="llm",
     model="gpt-4o-mini",
     instructions=[
         "Emphasize quality and thoroughness.",
         "Offer 10% discount for repeat customers.",
-        "Never go below $25 in first two rounds.",
+        "Never go below floor in first two rounds.",
     ],
 )
 ```
@@ -229,14 +256,29 @@ async with buyer:
     )
     
     if result.success:
-        print(f"Paid: ${result.final_price:.2f}")
+        # Estimate info (if seller supports estimation)
+        if result.estimate:
+            print(f"Estimated: ${result.estimate['amount']:.2f}")
+            print(f"Range: ${result.estimate['minimum']:.2f}+")
+        
+        print(f"Final price: ${result.final_price:.2f}")
         print(f"TX: {result.explorer_url}")
         print(result.output)
 ```
 
+The buyer automatically:
+1. Discovers seller capabilities
+2. Requests estimate (if seller supports `apex/estimate`)
+3. Checks if estimate exceeds budget → fails fast
+4. Uses estimate to calculate smarter initial offer
+5. Negotiates to agreement
+6. Pays and receives output
+
 **Verbose Output:**
 
 ```
+💬 NEGOTIATION
+
 ▸ Round 1/5
 
 🛒 BUYER [offers $18.00]
@@ -259,6 +301,7 @@ async with buyer:
    "Deal!"
 
 ✅ Seller accepted $25.00
+   Settled at 83% of estimate ($30.00)
 💸 Payment confirmed: https://basescan.org/tx/0x7a3b...
 ```
 
@@ -316,10 +359,10 @@ APEX extends the [Agent Skills](https://agentskills.io) standard:
 
 ```
 my-skill/
-├── SKILL.md          # Capability description
-├── handler.py        # Implementation
-├── apex.yaml         # APEX pricing config
-└── requirements.txt  # Dependencies
+â”œâ”€â”€ SKILL.md          # Capability description
+â”œâ”€â”€ handler.py        # Implementation
+â”œâ”€â”€ apex.yaml         # APEX pricing config
+â””â”€â”€ requirements.txt  # Dependencies
 ```
 
 ### SKILL.md
@@ -340,6 +383,28 @@ You are a research assistant. When given a topic:
 ### apex.yaml
 
 ```yaml
+# Base rate mode (recommended) - agent estimates per task
+pricing:
+  model: negotiated
+  base: 20.00              # Base rate for estimation
+  max_rounds: 5
+  strategy: balanced
+  currency: USDC
+  
+  # Optional: guide the estimator
+  instructions:
+    - "Legal topics: 2x"
+    - "Multi-language: 1.5x"
+
+handler:
+  file: handler.py
+  function: run
+```
+
+Or with static bounds (legacy):
+
+```yaml
+# Static bounds mode - fixed price range
 pricing:
   model: negotiated
   target: 25.00
@@ -375,19 +440,26 @@ Buyer                                    Seller
   │         capabilities, pricing          │
   │<───────────────────────────────────────│
   │                                        │
-  │  2. apex/propose ($15)                 │
+  │  2. apex/estimate (if supported)       │
+  │───────────────────────────────────────>│
+  │                                        │
+  │         price range for THIS task      │
+  │         $18-$30 based on complexity    │
+  │<───────────────────────────────────────│
+  │                                        │
+  │  3. apex/propose ($15)                 │
   │───────────────────────────────────────>│
   │                                        │
   │         counter ($25)                  │
   │<───────────────────────────────────────│
   │                                        │
-  │  3. apex/counter ($20)                 │
+  │  4. apex/counter ($20)                 │
   │───────────────────────────────────────>│
   │                                        │
   │         counter ($22)                  │
   │<───────────────────────────────────────│
   │                                        │
-  │  4. apex/accept ($22)                  │
+  │  5. apex/accept ($22)                  │
   │───────────────────────────────────────>│
   │                                        │
   │  ╔═══════════════════════════════════╗ │
@@ -399,6 +471,8 @@ Buyer                                    Seller
   │         output                         │
   │<───────────────────────────────────────│
 ```
+
+**Key insight:** The `apex/estimate` step lets the seller analyze the *specific task* before committing to a price range. A simple lookup might be $8, while deep research on the same topic could be $40—all from the same agent with the same base rate.
 
 ---
 
@@ -424,28 +498,49 @@ agent = apex.from_api(
     price=apex.Fixed(1.00),
 )
 
-# Wrap curl command
+# Wrap curl command with estimation
 agent = apex.from_curl(
     name="My Service",
     curl='curl -X POST https://api.example.com -d "{{input.data}}"',
-    price=apex.Negotiated(target=5.00, minimum=2.00),
+    price=apex.Negotiated(base=10.00),  # Estimates per-task
 )
 
-# Custom handler
+# Custom handler with static bounds
 agent = apex.create_agent(
     name="Custom",
-    price=apex.Fixed(5.00),
+    price=apex.Negotiated(target=25.00, minimum=10.00),
     handler=my_async_function,
 )
 
 # Add pricing to existing skill
-apex.add_apex("./skill", price=apex.Fixed(5.00))
+apex.add_apex("./skill", price=apex.Negotiated(base=15.00))
 
 # Export as skill folder
 agent.export("./output")
 
 # Serve
 agent.serve(port=8001)
+```
+
+### Pricing Options
+
+```python
+# Fixed - exact price, no negotiation
+apex.Fixed(5.00)
+apex.Fixed(5.00, currency="USDC")
+
+# Negotiated with estimation (recommended)
+apex.Negotiated(base=20.00)
+apex.Negotiated(
+    base=20.00,
+    model="gpt-4o-mini",
+    instructions=["Legal: 2x", "Urgent: 1.5x"],
+    strategy="balanced",
+    max_rounds=5,
+)
+
+# Negotiated with static bounds (legacy)
+apex.Negotiated(target=50.00, minimum=25.00)
 ```
 
 ### Buyer API
@@ -478,10 +573,14 @@ result.success         # bool
 result.final_price     # float
 result.output          # dict
 result.rounds          # int
-result.history         # list
+result.history         # list[dict] - negotiation history
 result.tx_hash         # str (if paid)
 result.explorer_url    # str (BaseScan link)
 result.error           # str (if failed)
+
+# Estimation fields (if seller supports apex/estimate)
+result.estimate        # dict: {amount, minimum, low, currency}
+result.estimate_id     # str: estimate ID used in negotiation
 ```
 
 ### Wallet API
@@ -505,30 +604,6 @@ await wallet.transfer(to="0x...", amount=10.00)
 ---
 
 ## Examples
-
-### GPT Wrapper
-
-```python
-import apex
-
-agent = apex.from_api(
-    name="GPT-4 Assistant",
-    endpoint="https://api.openai.com/v1/chat/completions",
-    method="POST",
-    headers={
-        "Authorization": "Bearer {{env.OPENAI_API_KEY}}",
-        "Content-Type": "application/json",
-    },
-    body={
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": "{{input.prompt}}"}],
-    },
-    output="choices.0.message.content",
-    price=apex.Fixed(0.05),
-)
-
-agent.serve(port=8001)
-```
 
 ### Multi-Agent Pipeline
 
@@ -579,7 +654,7 @@ SELLER_PRIVATE_KEY=0x...
 APEX_NETWORK=base-sepolia   # testnet (default)
 APEX_NETWORK=base           # mainnet
 
-# LLM (for negotiation)
+# LLM (for estimation and negotiation)
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-...
 ```
@@ -625,6 +700,7 @@ apex/
 ├── agent.py           # Agent class
 ├── buyer.py           # Buyer with auto-negotiation
 ├── negotiation.py     # 4 strategies
+├── estimation.py      # LLM-based task estimation
 ├── loader.py          # Load skill folders
 ├── api.py             # from_api()
 ├── curl.py            # from_curl()
