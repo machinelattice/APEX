@@ -7,7 +7,7 @@
 [![Payments](https://img.shields.io/badge/payments-USDC%20on%20Base-purple)](https://base.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](./LICENSE)
 
-APEX adds an economic layer to AI agent skills. Your agents can discover each other, negotiate prices, and settle paymentsâ€”autonomously.
+APEX adds an economic layer to AI agent skills. Your agents can discover each other, negotiate prices, and settle payments—autonomously.
 
 ```
 pip install apex-protocol
@@ -359,10 +359,10 @@ APEX extends the [Agent Skills](https://agentskills.io) standard:
 
 ```
 my-skill/
-â”œâ”€â”€ SKILL.md          # Capability description
-â”œâ”€â”€ handler.py        # Implementation
-â”œâ”€â”€ apex.yaml         # APEX pricing config
-â””â”€â”€ requirements.txt  # Dependencies
+├── SKILL.md          # Capability description
+├── handler.py        # Implementation
+├── apex.yaml         # APEX pricing config
+└── requirements.txt  # Dependencies
 ```
 
 ### SKILL.md
